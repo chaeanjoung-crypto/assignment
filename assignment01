@@ -1,0 +1,375 @@
+pip install ortools
+
+# -*- coding: utf-8 -*-
+
+import math
+import pandas as pd
+from collections import Counter, defaultdict
+from ortools.sat.python import cp_model
+from google.colab import drive
+drive.mount('/content/drive')
+
+# -----------------------------
+# 경로
+# -----------------------------
+INPUT_CSV = "/content/drive/MyDrive/학급반편성CSP 문제 입력파일.csv"
+OUT_ASSIGN_CSV = "/content/drive/MyDrive/학급반편성_결과.csv"
+OUT_SUMMARY_TXT = "/content/drive/MyDrive/학급반편성_요약.txt"
+
+# -----------------------------
+# 유틸
+# -----------------------------
+def yesno(x):
+    if pd.isna(x): return False
+    s = str(x).strip().lower()
+    return s in ("y", "yes", "true", "1", "t")
+
+def to_id_list(x):
+    """쉼표/세미콜론/슬래시/공백 구분 가능. float형 '202502.0'도 정수로 정리."""
+    if pd.isna(x): 
+        return []
+    s = str(x).strip()
+    if not s:
+        return []
+    for sep in [",", ";", "/", "|"]:
+        s = s.replace(sep, " ")
+    toks = [t for t in s.split() if t]
+    out = []
+    for t in toks:
+        try:
+            out.append(int(float(t)))
+        except:
+            out.append(t)
+    return out
+
+# -----------------------------
+# 데이터 로드
+# -----------------------------
+df = pd.read_csv(INPUT_CSV, encoding="utf-8")
+
+COL_ID        = "id"
+COL_NAME      = "name"
+COL_SEX       = "sex"      # boy/girl
+COL_SCORE     = "score"
+COL_PREVCLASS = "24년 학급"
+COL_CLUB      = "클럽"
+COL_GOOD      = "좋은관계"
+COL_BAD       = "나쁜관계"
+COL_LEADER    = "Leadership"
+COL_PIANO     = "Piano"
+COL_ABSENT    = "비등교"
+COL_SPORT     = "운동선호"
+
+# 학생 ID 정규화
+students = []
+for _, row in df.iterrows():
+    sid = row[COL_ID]
+    try:
+        sid = int(float(sid))
+    except:
+        sid = str(sid)
+    students.append(sid)
+
+N = len(students)
+assert N == 200, f"학생 수가 200명이 아닙니다: {N}"
+
+idx_of = {sid: i for i, sid in enumerate(students)}
+
+# 속성 사전 구성
+names  = {sid: df.loc[i, COL_NAME] for i, sid in enumerate(students)}
+sex    = {sid: str(df.loc[i, COL_SEX]).strip().lower() for i, sid in enumerate(students)}
+score  = {sid: int(df.loc[i, COL_SCORE]) for i, sid in enumerate(students)}
+prevc  = {sid: ("" if pd.isna(df.loc[i, COL_PREVCLASS]) else str(df.loc[i, COL_PREVCLASS])) for i, sid in enumerate(students)}
+club   = {sid: ("" if pd.isna(df.loc[i, COL_CLUB]) else str(df.loc[i, COL_CLUB])) for i, sid in enumerate(students)}
+leader = {sid: yesno(df.loc[i, COL_LEADER]) for i, sid in enumerate(students)}
+piano  = {sid: yesno(df.loc[i, COL_PIANO])  for i, sid in enumerate(students)}
+absent = {sid: yesno(df.loc[i, COL_ABSENT]) for i, sid in enumerate(students)}
+sport  = {sid: yesno(df.loc[i, COL_SPORT])  for i, sid in enumerate(students)}
+
+good_rel_raw = {sid: to_id_list(df.loc[i, COL_GOOD]) for i, sid in enumerate(students)}
+bad_rel_raw  = {sid: to_id_list(df.loc[i, COL_BAD])  for i, sid in enumerate(students)}
+
+# 관계 정규화
+good_pairs = set()
+bad_pairs  = set()
+for sid, lst in good_rel_raw.items():
+    for t in lst:
+        if t in idx_of and sid != t:
+            a, b = (sid, t) if str(sid) < str(t) else (t, sid)
+            good_pairs.add((a, b))
+for sid, lst in bad_rel_raw.items():
+    for t in lst:
+        if t in idx_of and sid != t:
+            a, b = (sid, t) if str(sid) < str(t) else (t, sid)
+            bad_pairs.add((a, b))
+
+# '비등교' 학생별 멘토 후보 목록
+good_adj = defaultdict(set)
+for a, b in good_pairs:
+    good_adj[a].add(b)
+    good_adj[b].add(a)
+
+# -----------------------------
+# 파라미터
+# -----------------------------
+NUM_CLASSES = 6
+CLASS_IDS = list(range(NUM_CLASSES))
+SIZE_TARGET = {0: 34, 1: 34, 2: 33, 3: 33, 4: 33, 5: 33}
+
+# 알파벳 라벨
+CLASS_LABELS = {0: "a", 1: "b", 2: "c", 3: "d", 4: "e", 5: "f"}
+
+# (성별만 더 신경) 가중치
+W_SCORE_RANGE   = 5
+W_GENDER_DEV    = 8   # 성별 균형을 더 강하게
+W_PIANO_DEV     = 3
+W_ABSENT_DEV    = 3
+W_SPORT_DEV     = 2
+W_PREVCLASS_DEV = 2
+W_CLUB_DEV      = 2
+
+# ---- 남녀 하드캡: 데이터가 허용하는 최소값으로 자동 보정 ----
+GENDER_DIFF_CAP_REQUESTED = 6  # 사용자가 원하는 상한(너무 작으면 자동 보정됨)
+class_sizes = [SIZE_TARGET[c] for c in CLASS_IDS]
+total_girls = sum(1 for s in students if sex[s] == "girl")
+
+def min_feasible_gender_cap(total_girls, sizes):
+    """반별 |boys - girls| <= D 가 가능해지는 최소 D를 찾아 반환."""
+    D = 0
+    while True:
+        lower = 0  # 각 반 최소 여학생 합
+        upper = 0  # 각 반 최대 여학생 합
+        for s in sizes:
+            # |s - 2g| <= D  =>  g ∈ [ceil((s-D)/2), floor((s+D)/2)]
+            lo = math.ceil((s - D) / 2)
+            hi = math.floor((s + D) / 2)
+            if lo < 0: lo = 0
+            if hi > s: hi = s
+            lower += lo
+            upper += hi
+        if lower <= total_girls <= upper:
+            return D
+        D += 1
+
+GENDER_DIFF_CAP_MIN = min_feasible_gender_cap(total_girls, class_sizes)
+GENDER_DIFF_CAP = max(GENDER_DIFF_CAP_REQUESTED, GENDER_DIFF_CAP_MIN)
+print(f"[INFO] girls={total_girls}, cap_requested={GENDER_DIFF_CAP_REQUESTED}, cap_min={GENDER_DIFF_CAP_MIN}, cap_used={GENDER_DIFF_CAP}")
+
+def cap_map(values):
+    """라벨별 반당 상한치 맵: ceil(count/6) + 1 (여유 1)"""
+    cnt = Counter(values)
+    cap = {}
+    for k, v in cnt.items():
+        cap[k] = math.ceil(v / NUM_CLASSES) + 1
+    return cap
+
+prev_caps = cap_map([prevc[s] for s in students if prevc[s]])
+club_caps = cap_map([club[s]  for s in students if club[s]])
+
+# -----------------------------
+# CP-SAT 모델
+# -----------------------------
+model = cp_model.CpModel()
+
+x = {}
+for s in students:
+    for c in CLASS_IDS:
+        x[(s, c)] = model.NewBoolVar(f"x_{s}_{c}")
+
+# (H1) 각 학생은 정확히 1개 반
+for s in students:
+    model.Add(sum(x[(s, c)] for c in CLASS_IDS) == 1)
+
+# (H1) 반 정원
+for c in CLASS_IDS:
+    model.Add(sum(x[(s, c)] for s in students) == SIZE_TARGET[c])
+
+# (H2) 나쁜관계 금지
+for a, b in bad_pairs:
+    for c in CLASS_IDS:
+        model.Add(x[(a, c)] + x[(b, c)] <= 1)
+
+# (H3) 비등교 학생 멘토 동반
+for s in students:
+    if absent[s]:
+        mentors = [m for m in good_adj[s] if m in idx_of]
+        if mentors:
+            for c in CLASS_IDS:
+                model.Add(x[(s, c)] <= sum(x[(m, c)] for m in mentors))
+
+# (H4) 리더 최소 1명
+for c in CLASS_IDS:
+    model.Add(sum(x[(s, c)] for s in students if leader[s]) >= 1)
+
+# -----------------------------
+# 집계 표현
+# -----------------------------
+def class_count(mask):
+    return {c: sum(x[(s, c)] for s in students if mask(s)) for c in CLASS_IDS}
+
+def class_sum(values):
+    return {c: sum(values[s] * x[(s, c)] for s in students) for c in CLASS_IDS}
+
+# (S1) 성적 총합 범위 최소화
+class_scores = class_sum(score)
+min_score = model.NewIntVar(0, sum(score.values()), "min_score")
+max_score = model.NewIntVar(0, sum(score.values()), "max_score")
+model.AddMinEquality(min_score, list(class_scores.values()))
+model.AddMaxEquality(max_score, list(class_scores.values()))
+score_range = model.NewIntVar(0, sum(score.values()), "score_range")
+model.Add(score_range == max_score - min_score)
+
+# (S2) 성별 편차 최소화 + (H6) 남녀 차이 하드 상한(자동 보정 cap 사용)
+boys  = class_count(lambda s: sex[s] == "boy")
+girls = class_count(lambda s: sex[s] == "girl")
+gender_devs = []
+for c in CLASS_IDS:
+    diff = model.NewIntVar(-200, 200, f"gender_diff_{c}")
+    dev  = model.NewIntVar(0, 200, f"gender_dev_{c}")
+    model.Add(diff == boys[c] - girls[c])
+    model.AddAbsEquality(dev, diff)
+    # 하드 제약: |boys - girls| <= GENDER_DIFF_CAP
+    model.Add(diff <=  GENDER_DIFF_CAP)
+    model.Add(diff >= -GENDER_DIFF_CAP)
+    gender_devs.append(dev)
+
+# (S3) 피아노 균등
+pianos = class_count(lambda s: piano[s])
+target_piano = sum(1 for s in students if piano[s]) // NUM_CLASSES
+piano_devs = []
+for c in CLASS_IDS:
+    diff = model.NewIntVar(-200, 200, f"piano_diff_{c}")
+    dev  = model.NewIntVar(0, 200, f"piano_dev_{c}")
+    model.Add(diff == pianos[c] - target_piano)
+    model.AddAbsEquality(dev, diff)
+    piano_devs.append(dev)
+
+# (S4) 비등교 균등
+absents = class_count(lambda s: absent[s])
+target_absent = sum(1 for s in students if absent[s]) // NUM_CLASSES
+absent_devs = []
+for c in CLASS_IDS:
+    diff = model.NewIntVar(-200, 200, f"absent_diff_{c}")
+    dev  = model.NewIntVar(0, 200, f"absent_dev_{c}")
+    model.Add(diff == absents[c] - target_absent)
+    model.AddAbsEquality(dev, diff)
+    absent_devs.append(dev)
+
+# (S5) 운동 균등
+sports = class_count(lambda s: sport[s])
+target_sport = sum(1 for s in students if sport[s]) // NUM_CLASSES
+sport_devs = []
+for c in CLASS_IDS:
+    diff = model.NewIntVar(-200, 200, f"sport_diff_{c}")
+    dev  = model.NewIntVar(0, 200, f"sport_dev_{c}")
+    model.Add(diff == sports[c] - target_sport)
+    model.AddAbsEquality(dev, diff)
+    sport_devs.append(dev)
+
+# (S6) 전년도 학급 편중 억제
+prev_labels = sorted(set(v for v in prevc.values() if v))
+prev_violations = []
+for k in prev_labels:
+    cap = prev_caps[k]
+    members = [s for s in students if prevc[s] == k]
+    for c in CLASS_IDS:
+        cnt_expr = sum(x[(s, c)] for s in members)
+        v = model.NewIntVar(0, 200, f"prev_violation_{k}_{c}")
+        model.Add(v >= cnt_expr - cap)
+        prev_violations.append(v)
+
+# (S7) 클럽 편중 억제
+club_labels = sorted(set(v for v in club.values() if v))
+club_violations = []
+for k in club_labels:
+    cap = club_caps[k]
+    members = [s for s in students if club[s] == k]
+    for c in CLASS_IDS:
+        cnt_expr = sum(x[(s, c)] for s in members)
+        v = model.NewIntVar(0, 200, f"club_violation_{k}_{c}")
+        model.Add(v >= cnt_expr - cap)
+        club_violations.append(v)
+
+# 목적함수
+model.Minimize(
+    W_SCORE_RANGE   * score_range
+  + W_GENDER_DEV    * sum(gender_devs)
+  + W_PIANO_DEV     * sum(piano_devs)
+  + W_ABSENT_DEV    * sum(absent_devs)
+  + W_SPORT_DEV     * sum(sport_devs)
+  + W_PREVCLASS_DEV * sum(prev_violations)
+  + W_CLUB_DEV      * sum(club_violations)
+)
+
+# -----------------------------
+# 풀기
+# -----------------------------
+solver = cp_model.CpSolver()
+solver.parameters.max_time_in_seconds = 120.0
+solver.parameters.num_workers = 8
+status = solver.Solve(model)
+
+# -----------------------------
+# 결과 저장
+# -----------------------------
+with open(OUT_SUMMARY_TXT, "w", encoding="utf-8") as f:
+    f.write(f"Status: {solver.StatusName(status)}\n")
+    f.write(f"Objective: {solver.ObjectiveValue()}\n")
+    f.write(f"WallTime: {solver.WallTime():.2f}s\n\n")
+    f.write(f"[INFO] girls_total={total_girls}, "
+            f"gender_cap_requested={GENDER_DIFF_CAP_REQUESTED}, "
+            f"gender_cap_min_feasible={GENDER_DIFF_CAP_MIN}, "
+            f"gender_cap_used={GENDER_DIFF_CAP}\n\n")
+
+    if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        assign = {}
+        for s in students:
+            for c in CLASS_IDS:
+                if solver.Value(x[(s, c)]) == 1:
+                    assign[s] = c
+                    break
+
+        # CSV 출력 (UTF-8 with BOM → 엑셀 한글 깨짐 방지)
+        rows = []
+        for s in students:
+            rows.append({
+                "id": s,
+                "name": names[s],
+                "class": CLASS_LABELS[assign[s]], 
+                "sex": sex[s],
+                "score": score[s],
+                "prev_class": prevc[s],
+                "club": club[s],
+                "Leadership": int(leader[s]),
+                "Piano": int(piano[s]),
+                "Absent": int(absent[s]),
+                "Sport": int(sport[s]),
+            })
+        pd.DataFrame(rows).to_csv(OUT_ASSIGN_CSV, index=False, encoding="utf-8-sig")
+
+        # 요약
+        class_members = {c: [s for s in students if assign[s] == c] for c in CLASS_IDS}
+        f.write("== Class Summary ==\n")
+        for c in CLASS_IDS:
+            mem = class_members[c]
+            sc  = sum(score[s] for s in mem)
+            nb  = sum(1 for s in mem if sex[s] == "boy")
+            ng  = sum(1 for s in mem if sex[s] == "girl")
+            ld  = sum(1 for s in mem if leader[s])
+            pi  = sum(1 for s in mem if piano[s])
+            ab  = sum(1 for s in mem if absent[s])
+            sp  = sum(1 for s in mem if sport[s])
+            f.write(f"Class {CLASS_LABELS[c]}: size={len(mem)}, score_sum={sc}, boys/girls={nb}/{ng}, "
+                    f"L={ld}, P={pi}, A={ab}, S={sp}\n")
+
+        min_sc = solver.Value(min_score); max_sc = solver.Value(max_score)
+        f.write(f"\nScore range: {min_sc} ~ {max_sc} (Δ={max_sc - min_sc})\n")
+        f.write(f"Gender dev sum: {sum(solver.Value(v) for v in gender_devs)}\n")
+        f.write(f"Piano dev sum:  {sum(solver.Value(v) for v in piano_devs)}\n")
+        f.write(f"Absent dev sum: {sum(solver.Value(v) for v in absent_devs)}\n")
+        f.write(f"Sport  dev sum: {sum(solver.Value(v) for v in sport_devs)}\n")
+        f.write(f"Prev-class violations: {sum(solver.Value(v) for v in prev_violations)}\n")
+        f.write(f"Club violations:      {sum(solver.Value(v) for v in club_violations)}\n")
+    else:
+        # 불능이면 CSV 저장하지 않음 (요청사항)
+        f.write("해결 불가. 가중치/상한/시간제한을 조정해 재시도하세요.\n")
